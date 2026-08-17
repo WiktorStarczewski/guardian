@@ -2178,13 +2178,15 @@ describe('Multisig', () => {
       proposal.metadata = {
         proposalType: 'add_signer',
         targetThreshold: 2,
-        targetSignerCommitments: ['0x' + 'a'.repeat(64)],
+        targetSignerCommitments: [mockSigner.commitment],
         description: '',
       };
 
+      vi.mocked(executeForSummary).mockClear();
       const json = await multisig.signProposalOffline(proposal.id);
       const parsed = JSON.parse(json);
       expect(parsed.signatures.length).toBeGreaterThan(0);
+      expect(executeForSummary).not.toHaveBeenCalled();
     });
   });
 
