@@ -1004,7 +1004,7 @@ describe('Multisig', () => {
       expect(proposals[0].status).toBe('ready');
     });
 
-    it('should reject proposals whose metadata does not match tx_summary', async () => {
+    it('should sync proposals without re-executing metadata (block-dependent binding removed)', async () => {
       const config = {
         threshold: 1,
         signerCommitments: ['0x' + 'a'.repeat(64)],
@@ -1042,15 +1042,17 @@ describe('Multisig', () => {
         }),
       });
 
-      vi.mocked(executeForSummary).mockResolvedValueOnce({
-        toCommitment: () => ({
-          toHex: () => '0x' + 'f'.repeat(64),
-        }),
-      } as any);
+      vi.mocked(executeForSummary).mockClear();
 
-      await expect(multisig.syncProposals()).rejects.toThrow(
-        'Invalid proposal: metadata does not match tx_summary'
-      );
+      // syncProposals used to re-execute each proposal's metadata to a
+      // TransactionSummary and reject on a commitment mismatch. That check was
+      // block-dependent (the tx fee comes from the reference block), so a second
+      // signer syncing at a later block height could not load the account at all.
+      // The re-exec binding is removed: sync must succeed and must not re-execute.
+      const proposals = await multisig.syncProposals();
+      expect(proposals.length).toBe(1);
+      expect(proposals[0].id).toBe('0x' + 'c'.repeat(64));
+      expect(executeForSummary).not.toHaveBeenCalled();
     });
 
     it('should reject non-32-byte signer IDs from GUARDIAN proposals', async () => {
@@ -1256,7 +1258,7 @@ describe('Multisig', () => {
       );
     });
 
-    it('should reject a response whose tx_summary does not match the provided metadata', async () => {
+    it('should accept a created proposal without re-executing metadata (block-dependent binding removed)', async () => {
       const config = {
         threshold: 1,
         signerCommitments: ['0x' + 'a'.repeat(64)],
@@ -1289,20 +1291,20 @@ describe('Multisig', () => {
         }),
       });
 
-      vi.mocked(executeForSummary).mockResolvedValueOnce({
-        toCommitment: () => ({
-          toHex: () => '0x' + 'f'.repeat(64),
-        }),
-      } as any);
+      vi.mocked(executeForSummary).mockClear();
 
-      await expect(
-        multisig.createProposal(1, 'AQID', {
-          proposalType: 'add_signer',
-          targetThreshold: 1,
-          targetSignerCommitments: ['0x' + 'a'.repeat(64)],
-          description: '',
-        })
-      ).rejects.toThrow('Invalid proposal: metadata does not match tx_summary');
+      // The removed re-exec binding no longer re-derives the summary from the
+      // response's metadata; the id <-> tx_summary commitment match is the only
+      // client-side integrity check, and execution-time signature verification
+      // binds metadata to the signed summary.
+      const proposal = await multisig.createProposal(1, 'AQID', {
+        proposalType: 'add_signer',
+        targetThreshold: 1,
+        targetSignerCommitments: ['0x' + 'a'.repeat(64)],
+        description: '',
+      });
+      expect(proposal.id).toBe('0x' + 'c'.repeat(64));
+      expect(executeForSummary).not.toHaveBeenCalled();
     });
   });
 
@@ -1984,10 +1986,10 @@ describe('Multisig', () => {
       expect(signedProposal.signatures.length).toBe(1);
     });
 
-    it('should reject signing when metadata does not match tx_summary', async () => {
+    it('should sign a proposal without re-executing metadata (block-dependent binding removed)', async () => {
       const config = {
         threshold: 1,
-        signerCommitments: ['0x' + 'a'.repeat(64)],
+        signerCommitments: [mockSigner.commitment],
         guardianCommitment: '0x' + 'c'.repeat(64),
       };
 
@@ -2024,15 +2026,42 @@ describe('Multisig', () => {
         description: '',
       });
 
-      vi.mocked(executeForSummary).mockResolvedValueOnce({
-        toCommitment: () => ({
-          toHex: () => '0x' + 'f'.repeat(64),
+      mockFetch.mockResolvedValueOnce({
+        ok: true,
+        json: async () => ({
+          ...mockDelta,
+          status: {
+            status: 'pending',
+            timestamp: '2024-01-01T00:00:00Z',
+            proposer_id: '0x' + 'c'.repeat(64),
+            cosigner_sigs: [
+              {
+                signer_id: mockSigner.commitment,
+                signature: { scheme: 'falcon', signature: '0x' + 'b'.repeat(128) },
+                timestamp: '2024-01-01T01:00:00Z',
+              },
+            ],
+          },
+          delta_payload: {
+            ...mockDelta.delta_payload,
+            metadata: {
+              proposal_type: 'add_signer',
+              description: '',
+              target_threshold: 1,
+              signer_commitments: ['0x' + 'a'.repeat(64)],
+            },
+          },
         }),
-      } as any);
+      });
 
-      await expect(multisig.signProposal('0x' + 'c'.repeat(64))).rejects.toThrow(
-        'Invalid proposal: metadata does not match tx_summary'
-      );
+      vi.mocked(executeForSummary).mockClear();
+
+      // A cosigner signs the tx_summary commitment; the removed re-exec binding
+      // no longer blocks signing (it was block-dependent, so a cosigner at a
+      // different sync height than the proposer could not sign).
+      const signed = await multisig.signProposal('0x' + 'c'.repeat(64));
+      expect(signed.signatures.length).toBe(1);
+      expect(executeForSummary).not.toHaveBeenCalled();
     });
 
     it('should reject proposals for a different account before signing', async () => {
@@ -2082,7 +2111,7 @@ describe('Multisig', () => {
   });
 
   describe('importProposal', () => {
-    it('should reject imported proposals whose metadata does not match tx_summary', async () => {
+    it('should import a proposal without re-executing metadata (block-dependent binding removed)', async () => {
       const config = {
         threshold: 1,
         signerCommitments: ['0x' + 'a'.repeat(64)],
@@ -2091,48 +2120,10 @@ describe('Multisig', () => {
 
       const multisig = createTestMultisig(config);
 
-      vi.mocked(executeForSummary).mockResolvedValueOnce({
-        toCommitment: () => ({
-          toHex: () => '0x' + 'f'.repeat(64),
-        }),
-      } as any);
+      vi.mocked(executeForSummary).mockClear();
 
-      await expect(
-        multisig.importProposal(
-          JSON.stringify({
-            accountId: '0x' + 'a'.repeat(30),
-            nonce: 1,
-            commitment: '0x' + 'c'.repeat(64),
-            txSummaryBase64: 'AQID',
-            signatures: [],
-            metadata: {
-              proposalType: 'add_signer',
-              targetThreshold: 1,
-              targetSignerCommitments: ['0x' + 'a'.repeat(64)],
-              description: '',
-            },
-          })
-        )
-      ).rejects.toThrow('Invalid proposal: metadata does not match tx_summary');
-    });
-  });
-
-  describe('signProposalOffline', () => {
-    it('should reject signing imported proposals whose metadata does not match tx_summary', async () => {
-      const config = {
-        threshold: 1,
-        signerCommitments: ['0x' + 'a'.repeat(64)],
-        guardianCommitment: '0x' + 'c'.repeat(64),
-      };
-
-      const multisig = createTestMultisig(config);
-
-      vi.mocked(executeForSummary).mockResolvedValueOnce({
-        toCommitment: () => ({
-          toHex: () => '0x' + 'c'.repeat(64),
-        }),
-      } as any);
-
+      // Import validates the id <-> tx_summary commitment but no longer
+      // re-executes the metadata (that was block-dependent).
       const proposal = await multisig.importProposal(
         JSON.stringify({
           accountId: '0x' + 'a'.repeat(30),
@@ -2148,7 +2139,42 @@ describe('Multisig', () => {
           },
         })
       );
+      expect(proposal.id).toBe('0x' + 'c'.repeat(64));
+      expect(executeForSummary).not.toHaveBeenCalled();
+    });
+  });
 
+  describe('signProposalOffline', () => {
+    it('should offline-sign a proposal without re-executing metadata (block-dependent binding removed)', async () => {
+      const config = {
+        threshold: 1,
+        signerCommitments: [mockSigner.commitment],
+        guardianCommitment: '0x' + 'c'.repeat(64),
+      };
+
+      const multisig = createTestMultisig(config);
+
+      const proposal = await multisig.importProposal(
+        JSON.stringify({
+          accountId: '0x' + 'a'.repeat(30),
+          nonce: 1,
+          commitment: '0x' + 'c'.repeat(64),
+          txSummaryBase64: 'AQID',
+          signatures: [],
+          metadata: {
+            proposalType: 'add_signer',
+            targetThreshold: 1,
+            targetSignerCommitments: [mockSigner.commitment],
+            description: '',
+          },
+        })
+      );
+
+      // Metadata mutated after import. Previously the block-dependent re-exec
+      // binding rejected this at offline-sign time. That check is removed: the
+      // cosigner signs the tx_summary commitment (unchanged by the mutation), and
+      // metadata that no longer reconstructs to the signed summary fails on-chain
+      // at execution, not here.
       proposal.metadata = {
         proposalType: 'add_signer',
         targetThreshold: 2,
@@ -2156,15 +2182,9 @@ describe('Multisig', () => {
         description: '',
       };
 
-      vi.mocked(executeForSummary).mockResolvedValueOnce({
-        toCommitment: () => ({
-          toHex: () => '0x' + 'f'.repeat(64),
-        }),
-      } as any);
-
-      await expect(multisig.signProposalOffline(proposal.id)).rejects.toThrow(
-        'Invalid proposal: metadata does not match tx_summary'
-      );
+      const json = await multisig.signProposalOffline(proposal.id);
+      const parsed = JSON.parse(json);
+      expect(parsed.signatures.length).toBeGreaterThan(0);
     });
   });
 
@@ -2486,17 +2506,13 @@ describe('Multisig', () => {
       const ackSignature = '0x' + '6'.repeat(130);
       const finalRequest = { kind: 'final-change-threshold-request' };
 
-      vi.mocked(buildUpdateSignersTransactionRequest)
-        .mockResolvedValueOnce({
-          request: { kind: 'verify-change-threshold-request' },
-          salt: { toHex: () => '0x' + 'd'.repeat(64) },
-          configHash: { toHex: () => '0x' + 'e'.repeat(64) },
-        } as any)
-        .mockResolvedValueOnce({
-          request: finalRequest,
-          salt: { toHex: () => '0x' + 'd'.repeat(64) },
-          configHash: { toHex: () => '0x' + 'e'.repeat(64) },
-        } as any);
+      // Only one reconstruction now: verifyProposalMetadataBinding no longer
+      // re-executes the metadata, so the request is built once for execution.
+      vi.mocked(buildUpdateSignersTransactionRequest).mockResolvedValueOnce({
+        request: finalRequest,
+        salt: { toHex: () => '0x' + 'd'.repeat(64) },
+        configHash: { toHex: () => '0x' + 'e'.repeat(64) },
+      } as any);
 
       (multisig as any).proposals.set(cachedProposalId, {
         id: cachedProposalId,
@@ -2713,48 +2729,13 @@ describe('Multisig', () => {
       ).rejects.toThrow('not ready for execution');
     });
 
-    it('should throw when proposal metadata does not match tx_summary', async () => {
-      const config = {
-        threshold: 1,
-        signerCommitments: ['0x' + 'a'.repeat(64)],
-        guardianCommitment: '0x' + 'c'.repeat(64),
-      };
-
-      const multisig = createTestMultisig(config);
-      const proposalId = '0x' + 'c'.repeat(64);
-
-      vi.mocked(executeForSummary).mockResolvedValueOnce({
-        toCommitment: () => ({
-          toHex: () => '0x' + 'd'.repeat(64),
-        }),
-      } as any);
-
-      (multisig as any).proposals.set(proposalId, {
-        id: proposalId,
-        accountId: multisig.accountId,
-        nonce: 1,
-        status: 'ready',
-        txSummary: 'AQID',
-        signatures: [
-          {
-            signerId: '0x' + 'a'.repeat(64),
-            signature: { scheme: 'falcon', signature: '0x' + 'b'.repeat(128) },
-            timestamp: '2024-01-01T00:00:00Z',
-          },
-        ],
-        metadata: {
-          proposalType: 'change_threshold',
-          targetThreshold: 1,
-          targetSignerCommitments: ['0x' + 'a'.repeat(64)],
-          description: '',
-        },
-      });
-
-      await expect(multisig.createTransactionProposalRequest(proposalId)).rejects.toThrow(
-        `Invalid proposal: metadata does not match tx_summary for ${proposalId}`
-      );
-      expect(mockWebClient.executeTransaction).not.toHaveBeenCalled();
-    });
+    // NOTE: the former 'should throw when proposal metadata does not match
+    // tx_summary' test was removed. It asserted the metadata re-execution binding
+    // that createTransactionProposalRequest ran via verifyProposalMetadataBinding;
+    // that binding is removed (it was block-height dependent — see the doc comment
+    // on verifyProposalMetadataBinding). The retained "builds a non-switch request
+    // without executing" behavior is covered by 'should return a ready
+    // non-switch_guardian request without executing it' above.
 
     it('should reject switch_guardian requests when endpoint commitment mismatches', async () => {
       const config = {
@@ -2881,17 +2862,13 @@ describe('Multisig', () => {
         const proposalId = '0x' + 'c'.repeat(64);
         const finalRequest = { kind: 'fresh-message-word-request' };
 
-        vi.mocked(buildUpdateSignersTransactionRequest)
-          .mockResolvedValueOnce({
-            request: { kind: 'verify-change-threshold-request' },
-            salt: { toHex: () => '0x' + 'd'.repeat(64) },
-            configHash: { toHex: () => '0x' + 'e'.repeat(64) },
-          } as any)
-          .mockResolvedValueOnce({
-            request: finalRequest,
-            salt: { toHex: () => '0x' + 'd'.repeat(64) },
-            configHash: { toHex: () => '0x' + 'e'.repeat(64) },
-          } as any);
+        // Only one reconstruction now: verifyProposalMetadataBinding no longer
+        // re-executes the metadata, so the request is built once for execution.
+        vi.mocked(buildUpdateSignersTransactionRequest).mockResolvedValueOnce({
+          request: finalRequest,
+          salt: { toHex: () => '0x' + 'd'.repeat(64) },
+          configHash: { toHex: () => '0x' + 'e'.repeat(64) },
+        } as any);
 
         (multisig as any).proposals.set(proposalId, {
           id: proposalId,
