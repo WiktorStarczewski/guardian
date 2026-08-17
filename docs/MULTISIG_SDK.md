@@ -584,14 +584,17 @@ await multisig.exportNoteToFile(noteId);
 const importedNoteId = await multisig.importNoteFromBytes(noteFileBytes);
 ```
 
-> **Note:** every cosigner device that verifies or signs the consume-notes
-> proposal needs the note in its local store with the on-chain inclusion
-> proof — deliver the note file to each of them (import + sync), not just to
-> the proposer. A cosigner whose store lacks the authenticated note rebuilds
-> the transaction differently (the input-notes commitment distinguishes
-> authenticated from unauthenticated consumption) and rejects the proposal
-> with `metadata does not match tx_summary`. The sender's own device heals
-> itself: it already knows the full note, so a post-commit sync is enough.
+> **Note:** the device that **executes** the consume-notes proposal needs the
+> note in its local store with the on-chain inclusion proof — deliver the note
+> file to each cosigner (import + sync), any of whom may execute, not just to
+> the proposer. A store that lacks the authenticated note rebuilds the
+> transaction differently at execute time (the input-notes commitment
+> distinguishes authenticated from unauthenticated consumption), so the executed
+> transaction no longer matches the signed summary and its cosigner signatures
+> fail on-chain. (The client no longer rejects this at verify/sign time —
+> cosigners sign the tx_summary commitment directly; see the note on
+> `verifyProposalMetadataBinding`.) The sender's own device heals itself: it
+> already knows the full note, so a post-commit sync is enough.
 
 #### Consume Notes (Claim Received Funds)
 
