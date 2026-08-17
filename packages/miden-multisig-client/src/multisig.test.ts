@@ -2739,6 +2739,48 @@ describe('Multisig', () => {
     // without executing" behavior is covered by 'should return a ready
     // non-switch_guardian request without executing it' above.
 
+    it('should reject a proposal whose id does not match its tx_summary commitment', async () => {
+      // The block-independent id <-> tx_summary commitment check is now the sole
+      // client-side integrity guard (verifyProposalMetadataBinding no longer
+      // re-executes). A proposal whose id does not equal its tx_summary commitment
+      // must still be rejected before execution.
+      const config = {
+        threshold: 1,
+        signerCommitments: ['0x' + 'a'.repeat(64)],
+        guardianCommitment: '0x' + 'c'.repeat(64),
+      };
+      const multisig = createTestMultisig(config);
+
+      // computeCommitmentFromTxSummary is mocked to 0xccc… for any tx_summary, so
+      // an id of 0xddd… does not match its summary commitment.
+      const mismatchedId = '0x' + 'd'.repeat(64);
+      (multisig as any).proposals.set(mismatchedId, {
+        id: mismatchedId,
+        accountId: multisig.accountId,
+        nonce: 1,
+        status: 'ready',
+        txSummary: 'AQID',
+        signatures: [
+          {
+            signerId: '0x' + 'a'.repeat(64),
+            signature: { scheme: 'falcon', signature: '0x' + 'b'.repeat(128) },
+            timestamp: '2024-01-01T00:00:00Z',
+          },
+        ],
+        metadata: {
+          proposalType: 'change_threshold',
+          targetThreshold: 1,
+          targetSignerCommitments: ['0x' + 'a'.repeat(64)],
+          description: '',
+        },
+      });
+
+      await expect(
+        multisig.createTransactionProposalRequest(mismatchedId)
+      ).rejects.toThrow('does not match tx_summary commitment');
+      expect(mockWebClient.executeTransaction).not.toHaveBeenCalled();
+    });
+
     it('should reject switch_guardian requests when endpoint commitment mismatches', async () => {
       const config = {
         threshold: 1,
