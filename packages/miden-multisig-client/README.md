@@ -41,6 +41,12 @@ Guardian-stored account data, so an upgrade is not a drop-in. Full matrix, the
 breaking changes per line, and what each upgrade does to stored data:
 [MIDEN_COMPATIBILITY.md](https://github.com/OpenZeppelin/guardian/blob/main/docs/MIDEN_COMPATIBILITY.md).
 
+Renamed after `0.17.0-rc.1`, which shipped the old name: `summarySalt` is now
+`summaryAuthArg`. On Miden 0.16 the word it returns is the transaction's auth
+arg, which is only the salt when the request did not commit to fee conversion
+info, so the old name was misleading rather than merely different. There is no
+alias. Callers on `0.17.0-rc.1` or on the 0.16.x line rename at the call site.
+
 ## Setup
 
 ```typescript
@@ -381,7 +387,14 @@ import { buildP2idTransactionRequest } from '@openzeppelin/miden-multisig-client
 // The typed path is `createP2idProposal(recipient, faucet, amount,
 // { nonce, noteType, reclaimHeight, timelockHeight })`, which persists the
 // choices in signed metadata.
-const { request, salt } = buildP2idTransactionRequest(senderId, recipientId, faucetId, amount);
+// A custom proposal owns its own recipe, so unlike `createP2idProposal` it has to
+// commit the fee conversion info itself. Without it the auth arg carries none and
+// `fee::pay_fee` aborts at creation on any chain that charges a fee.
+const feeFaucetId = await multisig.getFeeFaucetId();
+const { request, salt } = buildP2idTransactionRequest(
+  senderId, recipientId, faucetId, amount,
+  { feeFaucetId },
+);
 const proposal = await multisig.createCustomProposal(request.serialize(), 'b2agg');
 
 // Cosigners review and sign through the usual signProposal flow.
@@ -395,31 +408,68 @@ const advice = await multisig.prepareCustomExecution(proposal.id, request.serial
 // (inputs + salt) with the advice, then submit. `submitTransaction` takes the
 // proposal id to execute at the proposal's anchored reference block, since the
 // collected signatures only authorize the summary produced there.
+// `feeFaucetId` is the value retained from creation, not a fresh read: the auth
+// arg commits it, so a re-read would stop reproducing the signed summary if the
+// chain's fee faucet had moved.
 const { request: finalRequest } = buildP2idTransactionRequest(
-  senderId, recipientId, faucetId, amount, { salt, signatureAdviceMap: advice },
+  senderId, recipientId, faucetId, amount,
+  { salt, signatureAdviceMap: advice, feeFaucetId },
 );
 await multisig.submitTransaction(proposal.id, finalRequest);
 ```
 
-The integration keeps only its own recipe (build inputs + salt) so it can
+The integration keeps only its own recipe (build inputs and salt) so it can
 reproduce the exact transaction at execute time — the SDK does not store the
-serialized request. The binding check guarantees the rebuilt transaction matches the
-commitment the cosigners signed.
+serialized request. The salt feeds the auth arg, so a rebuild that used a
+different one would not match. The binding check guarantees the rebuilt
+transaction matches the commitment the cosigners signed.
 
-If a recipe was not retained, recover the salt from the proposal's transaction
-summary with `summarySalt`:
+`SignatureOptions.feeFaucetId` is available on every builder and makes the auth
+arg commit to fee conversion info. **Set it.** The guarded-multisig auth
+component calls `fee::pay_fee` before building the summary, so on a chain whose
+`verification_base_fee` is non-zero an unset faucet produces a request that
+aborts at proving with `ERR_FEE_CONVERSION_INFO_MISSING`. Pass
+`getFeeFaucetId()`, which reads the faucet from the block a request built now
+will be anchored to. See
+[`docs/MIDEN_COMPATIBILITY.md`](https://github.com/OpenZeppelin/guardian/blob/main/docs/MIDEN_COMPATIBILITY.md).
+
+The faucet becomes part of the recipe: keep it alongside the salt and reuse the
+same value at execute time. Fee parameters are a per-block header field, so
+`getFeeFaucetId()` is not cached and a second call is not a substitute for
+retaining the first — by then the client may be synced to a different block.
+
+An integration that builds its own `TransactionRequestBuilder`, rather than
+going through the builders above, can reach the same wiring directly:
+
+| Export | Use |
+|--------|-----|
+| `applyAuthArg(builder, salt, feeFaucetId?)` | Sets the auth arg and, when a faucet is given, the advice entry — in one call, freeing every wasm handle involved. This is what the builders above use and what an integration should normally call. **It consumes `salt`**: pass a copy if you need it afterwards. |
+| `resolveAuthArg(salt, feeFaucetId?)` | Returns `{ authArg, adviceMap? }` without touching a builder, for a caller assembling the request some other way. `adviceMap` is absent on the bare path, where `authArg` *is* the salt handle rather than a copy. The caller owns what comes back. |
+| `nativeConversionInfo(feeFaucetId)` | The conversion-info `Word` for a faucet, at the native 1:1 rate. |
+| `feeAuthArg(conversionInfo, salt)` | The commitment `hash(CONVERSION_INFO \|\| SALT)`. |
+
+Omitting `feeFaucetId` from either of the first two reproduces the pre-0.16 bare
+auth arg, with the same consequence as omitting `SignatureOptions.feeFaucetId`.
+Prefer that option where a supplied builder covers the case; these are for the
+transaction shapes it does not.
+
+**Retain the salt.** It cannot be recovered from the proposal once the request
+commits fee conversion info, because the auth arg is then the commitment
+`hash(CONVERSION_INFO || SALT)` rather than the salt itself, and that is not
+invertible. `summaryAuthArg` reads the auth-arg word back out of a summary, but
+that word is the commitment, not the salt:
 
 ```typescript
-import { summarySalt } from '@openzeppelin/miden-multisig-client';
+import { summaryAuthArg } from '@openzeppelin/miden-multisig-client';
 import { TransactionSummary } from '@miden-sdk/miden-sdk';
 
-const salt = summarySalt(TransactionSummary.deserialize(bytes));
+const authArg = summaryAuthArg(TransactionSummary.deserialize(bytes));
 ```
 
 On the Miden 0.16 pre-release line a summary no longer carries a dedicated salt
 word: it binds seven user-defined elements, and the guarded-multisig auth
-component zeroes the leading three and passes the auth-arg salt as the trailing
-four. `summarySalt` reads that convention, so prefer it over indexing
+component zeroes the leading three and passes the auth args as the trailing
+four. `summaryAuthArg` reads that convention, so prefer it over indexing
 `userParams()` by hand.
 
 > **Rust ↔ TS parity:** both SDKs expose the same producer surface —
@@ -428,6 +478,35 @@ four. `summarySalt` reads that convention, so prefer it over indexing
 > only difference is advice injection: Rust mutates the request's advice map in
 > place (`request.advice_map_mut().extend(advice)`), while the immutable browser
 > `TransactionRequest` is rebuilt from the recipe with the advice.
+>
+> Both SDKs commit fee conversion info from every typed `create*Proposal` path,
+> and derive it the same way — rate 1/1 under the fee faucet named by the block
+> the proposal is anchored to. That is what keeps their proposals interchangeable
+> without transmitting the faucet: a rebuilder reads it from the anchor, which
+> travels with the proposal and is checked against the signed summary.
+> `createP2idProposal` overrides a `feeFaucetId` arriving through a structurally
+> compatible options object rather than honouring it, because a caller-chosen
+> faucet would produce a proposal no rebuild could reproduce.
+>
+> Either SDK's exported builders can still *decline* to commit — omit
+> `SignatureOptions.feeFaucetId` in TypeScript, or pass `None` for the
+> `Option<FeeConversionInfo>` parameter in Rust. That yields the pre-0.16 bare
+> auth arg, which only executes on a zero-fee chain. Neither SDK reads one back:
+> both rebuild every typed proposal from `salt_hex` as committed. Doing so
+> normally produces a custom proposal — and neither
+> SDK reconstructs those, so both can list, sign and drive one to submission.
+> Note that neither SDK's `executeProposal` accepts a custom proposal; submission
+> goes through the custom-execution path. `prepare_custom_execution` takes the
+> serialized request from the caller and only checks that it reproduces the
+> signed commitment, so a Rust integration handed the request TypeScript built
+> will pass that check; it just has no builder of its own that can rebuild it.
+> Retain the request bytes rather than expecting to regenerate them.
+>
+> Registering a bare-auth-arg request under a typed metadata shape instead — via
+> `createProposal` — is worse, and not merely uninteroperable: `list_proposals`
+> rebuilds every typed proposal from `salt_hex`, always as committed, and the
+> Rust SDK fails for the whole account rather than skipping the one it cannot
+> verify.
 
 ### Recover An Account By Key
 
@@ -591,9 +670,11 @@ import {
 
 ### Error taxonomy
 
-Each error class exposes a stable `.code` string identical to the Rust
-SDK's `MultisigError::code()` value, so cross-SDK tests and operator
-dashboards can branch on one taxonomy.
+Each error class exposes a stable `.code` string. Where the Rust SDK has
+an equivalent failure the code is identical to its
+`MultisigError::code()` value, so cross-SDK tests and operator dashboards
+can branch on one taxonomy; the two exceptions are called out below the
+table.
 
 | Error class | `.code` | When |
 |---|---|---|
@@ -601,6 +682,47 @@ dashboards can branch on one taxonomy.
 | `UnsupportedMetadataVersionError` | `consume_notes_unsupported_metadata_version` | Unrecognized version (including v1 on a cut-over build) |
 | `ConsumeNotesMetadataOversizeError` | `consume_notes_metadata_oversize` | v2 metadata serialization exceeds 256 KiB at creation |
 | `LegacyConsumeNotesNoteMissingError` | `consume_notes_legacy_note_missing` | v1 path: local store does not contain the referenced note |
+| `ProposalAuthArgUnresolvableError` | `proposal_auth_arg_unresolvable` | A proposal's signed auth arg is not the fee-conversion commitment its recorded salt and anchored fee faucet derive, so no reconstruction from that salt succeeds |
+| `ProposalSaltMalformedError` | `proposal_salt_malformed` | A proposal's recorded salt is not a readable 32-byte word |
+| `FeeFaucetAnchorMismatchError` | `fee_faucet_anchor_mismatch` | The chain's fee faucet changed mid-build, so the faucet the auth arg committed is not the one the proposal's anchored block reports |
+
+`fee_faucet_anchor_mismatch` is raised at creation, before the proposal is
+offered for signing, and is the one error here that is transient: build the
+proposal again against the now-current faucet. It carries
+`committedFeeFaucetIdHex` and `anchoredFeeFaucetIdHex`, so a caller that
+retries automatically can do so on the type rather than by matching the
+message. It has no Rust counterpart because the Rust create path cannot hit
+it: `ProposalBuilder::build_*` holds `&mut MidenSdkClient` across both the
+faucet read and the anchor capture, so the borrow checker forbids the
+interleaving sync that opens the window in JavaScript.
+
+The two proposal-recovery errors above it carry no Rust code, and both are
+fatal: the proposal has to be recreated. `proposal_auth_arg_unresolvable`
+has no Rust counterpart at all, because Rust derives the conversion info
+from the proposal's anchor and rebuilds as committed without a separate
+check, so a salt that does not derive the signed auth arg trips the generic
+binding check instead. `proposal_salt_malformed` does have a Rust
+behavioural equivalent — `Proposal::salt()` fails there on the same
+input — but it surfaces as an uncoded `InvalidConfig`.
+
+`switch_guardian` is the type to watch. It is the one
+`verifyProposalMetadataBinding` does not rebuild, so the derivation check
+is the only thing binding its salt — and that salt is served by the
+GUARDIAN being switched away from, the party with an interest in the
+switch failing. A corrupted salt therefore fails loudly here rather than
+aborting at proving with `ERR_FEE_CONVERSION_INFO_MISSING`, but an
+outgoing GUARDIAN can still strand a fully signed switch that way.
+Related: `syncProposals()` verifies everything GUARDIAN serves and rejects
+the whole call on the first proposal it cannot verify, so one unverifiable
+proposal served alongside a switch keeps it out of a *fresh* client's
+cache. That predates fee conversion info and the Rust `list_proposals` has
+the same shape, so closing it belongs to a coordinated change in both SDKs.
+
+`ProposalSaltMalformedError.saltHex` is typed `unknown`, because GUARDIAN's
+JSON response is cast rather than validated and the field arrives as
+whatever was served. It is non-enumerable, so it stays out of
+`util.inspect` and `JSON.stringify` output; the error's own message quotes
+a bounded, printable rendering of it.
 
 ### Cut-over policy
 
