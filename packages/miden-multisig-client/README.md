@@ -17,7 +17,7 @@ Miden multisig accounts store their authentication logic on-chain, but **their s
 ## Installation
 
 ```bash
-npm install @openzeppelin/miden-multisig-client @miden-sdk/miden-sdk@0.16.0-rc.5
+npm install @openzeppelin/miden-multisig-client @miden-sdk/miden-sdk@0.16.0-rc.7
 ```
 
 > **Why the peer version is exact**: no stable `0.16.0` is published, so a
@@ -356,6 +356,37 @@ const signedJson = await multisig.signProposalOffline(imported.id);
 console.log(signedJson);
 ```
 
+### Leave an Unreachable Guardian (Offline Switch)
+
+A switch-Guardian proposal can be created fully offline — nothing is pushed to
+the current Guardian, so an account can leave an operator that is down
+(mirrors the Rust `create_proposal_offline`). Only switch-Guardian proposals
+support this: every other type needs a Guardian acknowledgment at execution.
+The new endpoint must be reachable; its `/pubkey` commitment is verified
+before anything is signed.
+
+```typescript
+// Proposer: build, sign, and cache locally — the current Guardian is never contacted.
+const exported = await multisig.createSwitchGuardianProposalOffline(
+  'https://new-guardian.example',
+  newGuardianPubkey,
+);
+const json = JSON.stringify(exported); // share with cosigners side-channel
+
+// Cosigner: import, sign, send the updated JSON back.
+const imported = await cosigner.importProposal(json);
+const signedJson = await cosigner.signProposalOffline(imported.id);
+
+// Proposer: import the cosigned proposal and execute. The push to the old
+// Guardian is best-effort; registration happens on the new Guardian.
+const ready = await multisig.importProposal(signedJson);
+await multisig.executeProposal(ready.id);
+```
+
+For hand-rolled export/import flows, `computeCommitmentFromTxSummary` is
+exported: a proposal's `commitment` is its transaction summary's commitment,
+recomputed from the serialized summary.
+
 ### Custom Proposal Types
 
 GUARDIAN accepts any non-empty `proposalType`, so an integration can propose a
@@ -521,6 +552,23 @@ can plausibly recover more. In brief:
 
 For the full report semantics see
 [`docs/MULTISIG_SDK.md`](https://github.com/OpenZeppelin/guardian/blob/main/docs/MULTISIG_SDK.md).
+
+### Preserving notes across a guardian switch
+
+Pending proposals do not survive a guardian switch — the new GUARDIAN is
+registered with bare account state — so the notes embedded in the old
+GUARDIAN's pending consume-notes proposals are the one recovery source
+`recoverNotes` can no longer reach after the repoint. `executeProposal`
+runs the proposal-import slice automatically on the switch-guardian path
+(against the old GUARDIAN, before the switch transaction executes),
+best-effort and bounded by a 30s timeout with cooperative cancellation;
+the transport drain and public backfill deliberately do not run there (an
+intact local store loses nothing they rescan). When repointing a client by
+hand via `setGuardianClient`, request the same preservation first:
+
+```typescript
+const report = await multisig.preservePreSwitchProposalNotes();
+```
 
 ## Transaction Utilities
 
